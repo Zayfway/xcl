@@ -260,7 +260,172 @@ fn scripted() -> u32 {
     });
     // seconds since the host started, as the log's times (not since the title first polled)
     let t = crate::log::uptime();
-    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g)
+    at.iter().filter(|&&(s, _)| t >= s && t < s + 0.2).fold(0, |b, &(_, g)| b | g) | live::held()
+}
+
+/// `XCL_PRESS_LIVE=<file>`: lines appended to the file while the title runs are pressed in
+/// order, one after another – `BUTTON[+BUTTON…][:ms]` (names as `XCL_PRESS_AT`), held `ms`
+/// milliseconds (200 unless said), 150 ms of nothing after each; `wait:ms` holds nothing.
+/// Lines already in the file at the start are not pressed, and a line is taken only once its
+/// newline is written. `XCL_PRESS_AT` needs every press timed before the run; this lets a
+/// script (or an agent) decide the next press after it has seen the last screen, without the
+/// window's focus.
+mod live {
+    use std::collections::VecDeque;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// The gap after each line, so that the same button twice is two presses.
+    const GAP: Duration = Duration::from_millis(150);
+
+    /// One line of the file: the buttons held together and for how long. `None` for a blank
+    /// line or a button name `XCL_PRESS_AT` does not know.
+    pub(super) fn parse(line: &str) -> Option<(u32, Duration)> {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let (names, ms) = match line.rsplit_once(':') {
+            Some((names, ms)) => (names, ms.trim().parse().ok()?),
+            None => (line, 200),
+        };
+        let mask = if names.trim().eq_ignore_ascii_case("wait") {
+            0
+        } else {
+            names
+                .split('+')
+                .map(|n| super::button_named(&n.trim().to_ascii_uppercase()))
+                .try_fold(0, |b, g| Some(b | g?))?
+        };
+        Some((mask, Duration::from_millis(ms)))
+    }
+
+    /// Lines waiting their turn, and the one being held.
+    #[derive(Default)]
+    pub(super) struct Queue {
+        waiting: VecDeque<(u32, Duration)>,
+        current: Option<(u32, Instant)>,
+    }
+
+    impl Queue {
+        pub(super) fn push(&mut self, mask: u32, hold: Duration) {
+            self.waiting.push_back((mask, hold));
+            self.waiting.push_back((0, GAP));
+        }
+
+        /// The buttons held at `now`; a line's time starts when it is first asked for, so a
+        /// title that polls late still sees every press.
+        pub(super) fn held(&mut self, now: Instant) -> u32 {
+            loop {
+                if let Some((mask, until)) = self.current {
+                    if now < until {
+                        return mask;
+                    }
+                }
+                let Some((mask, hold)) = self.waiting.pop_front() else {
+                    self.current = None;
+                    return 0;
+                };
+                self.current = Some((mask, now + hold));
+            }
+        }
+    }
+
+    static QUEUE: LazyLock<Option<Mutex<Queue>>> = LazyLock::new(|| {
+        let path = std::path::PathBuf::from(std::env::var_os("XCL_PRESS_LIVE")?);
+        let start = std::fs::metadata(&path).map_or(0, |m| m.len());
+        std::thread::Builder::new()
+            .name("xcl-press-live".into())
+            .spawn(move || follow(&path, start))
+            .ok()?;
+        Some(Mutex::new(Queue::default()))
+    });
+
+    /// Reads what is appended to `path` from byte `offset` on, every 100 ms, and queues each
+    /// complete line.
+    fn follow(path: &std::path::Path, mut offset: u64) {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let Ok(text) = std::fs::read(path) else {
+                continue;
+            };
+            if (text.len() as u64) < offset {
+                // The file was emptied: start over from its beginning.
+                offset = 0;
+            }
+            let fresh = &text[offset as usize..];
+            let Some(end) = fresh.iter().rposition(|&b| b == b'\n') else {
+                continue;
+            };
+            offset += end as u64 + 1;
+            let Some(queue) = QUEUE.as_ref() else { return };
+            let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+            for line in String::from_utf8_lossy(&fresh[..end]).lines() {
+                match parse(line) {
+                    Some((mask, hold)) => {
+                        crate::xlog_info!("GameInput: XCL_PRESS_LIVE {line:?} pressed");
+                        queue.push(mask, hold);
+                    }
+                    None if !line.trim().is_empty() => {
+                        crate::xlog_warn!("GameInput: XCL_PRESS_LIVE {line:?} not understood (BUTTON[+BUTTON][:ms] or wait:ms)");
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// The buttons the live file holds down now.
+    pub(super) fn held() -> u32 {
+        let Some(queue) = QUEUE.as_ref() else {
+            return 0;
+        };
+        queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held(Instant::now())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{A, B, DPAD_DOWN, LEFT_SHOULDER};
+        use super::*;
+
+        #[test]
+        fn lines_name_buttons_holds_and_waits() {
+            let ms = Duration::from_millis;
+            assert_eq!(parse("A"), Some((A, ms(200))));
+            assert_eq!(
+                parse(" down+lb:1500 "),
+                Some((DPAD_DOWN | LEFT_SHOULDER, ms(1500)))
+            );
+            assert_eq!(parse("wait:300"), Some((0, ms(300))));
+            assert_eq!(parse(""), None);
+            assert_eq!(
+                parse("Bogus"),
+                None,
+                "an unknown button is not pressed as nothing"
+            );
+            assert_eq!(parse("B:soon"), None);
+        }
+
+        #[test]
+        fn lines_are_held_one_after_the_other_with_a_gap() {
+            let t = Instant::now();
+            let ms = Duration::from_millis;
+            let mut q = Queue::default();
+            q.push(B, ms(200));
+            q.push(B, ms(200));
+            // The first line's time starts when it is first asked for.
+            assert_eq!(q.held(t + ms(1000)), B);
+            assert_eq!(q.held(t + ms(1199)), B);
+            // Then the gap, so the second B is a press of its own.
+            assert_eq!(q.held(t + ms(1200)), 0);
+            assert_eq!(q.held(t + ms(1350)), B);
+            assert_eq!(q.held(t + ms(1550)), 0);
+            assert_eq!(q.held(t + ms(5000)), 0, "nothing left");
+        }
+    }
 }
 
 #[link(name = "user32")]
