@@ -270,6 +270,12 @@ fn scripted() -> u32 {
 /// newline is written. `XCL_PRESS_AT` needs every press timed before the run; this lets a
 /// script (or an agent) decide the next press after it has seen the last screen, without the
 /// window's focus.
+///
+/// The file is append-only: only the bytes past those already read are read on each look
+/// (every 100 ms). Emptying it (or replacing it with a shorter file) starts over from its
+/// beginning; replacing it with a longer one between two looks reads its tail as if appended.
+/// A line's hold starts when the title first polls after it is due, so a title that polls
+/// late still sees every press, in order.
 mod live {
     use std::collections::VecDeque;
     use std::sync::{LazyLock, Mutex};
@@ -279,7 +285,8 @@ mod live {
     const GAP: Duration = Duration::from_millis(150);
 
     /// One line of the file: the buttons held together and for how long. `None` for a blank
-    /// line or a button name `XCL_PRESS_AT` does not know.
+    /// line, a button name `XCL_PRESS_AT` does not know, or a press held 0 ms (the title could
+    /// never see it).
     pub(super) fn parse(line: &str) -> Option<(u32, Duration)> {
         let line = line.trim();
         if line.is_empty() {
@@ -297,6 +304,9 @@ mod live {
                 .map(|n| super::button_named(&n.trim().to_ascii_uppercase()))
                 .try_fold(0, |b, g| Some(b | g?))?
         };
+        if mask != 0 && ms == 0 {
+            return None;
+        }
         Some((mask, Duration::from_millis(ms)))
     }
 
@@ -341,26 +351,52 @@ mod live {
         Some(Mutex::new(Queue::default()))
     });
 
-    /// Reads what is appended to `path` from byte `offset` on, every 100 ms, and queues each
-    /// complete line.
+    /// Appends `fresh` to `partial` (the bytes read so far that do not end a line yet) and
+    /// takes out the complete lines.
+    pub(super) fn complete_lines(partial: &mut Vec<u8>, fresh: &[u8]) -> Vec<String> {
+        partial.extend_from_slice(fresh);
+        let Some(end) = partial.iter().rposition(|&b| b == b'\n') else {
+            return Vec::new();
+        };
+        let lines = String::from_utf8_lossy(&partial[..end]).lines().map(str::to_owned).collect();
+        partial.drain(..=end);
+        lines
+    }
+
+    /// Reads what is appended to `path` from byte `offset` on, every 100 ms (only the new
+    /// bytes), and queues each complete line.
     fn follow(path: &std::path::Path, mut offset: u64) {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut partial = Vec::new();
         loop {
             std::thread::sleep(Duration::from_millis(100));
-            let Ok(text) = std::fs::read(path) else {
+            let Ok(mut file) = std::fs::File::open(path) else {
                 continue;
             };
-            if (text.len() as u64) < offset {
-                // The file was emptied: start over from its beginning.
+            let Ok(len) = file.metadata().map(|m| m.len()) else {
+                continue;
+            };
+            if len < offset {
+                // Emptied, or replaced by a shorter file: start over from its beginning.
                 offset = 0;
+                partial.clear();
             }
-            let fresh = &text[offset as usize..];
-            let Some(end) = fresh.iter().rposition(|&b| b == b'\n') else {
+            if len == offset {
                 continue;
-            };
-            offset += end as u64 + 1;
+            }
+            let mut fresh = Vec::new();
+            if file.seek(SeekFrom::Start(offset)).is_err() || file.take(len - offset).read_to_end(&mut fresh).is_err() {
+                continue;
+            }
+            offset += fresh.len() as u64;
+            let lines = complete_lines(&mut partial, &fresh);
+            if lines.is_empty() {
+                continue;
+            }
             let Some(queue) = QUEUE.as_ref() else { return };
             let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
-            for line in String::from_utf8_lossy(&fresh[..end]).lines() {
+            for line in &lines {
+                let line = line.as_str();
                 match parse(line) {
                     Some((mask, hold)) => {
                         crate::xlog_info!("GameInput: XCL_PRESS_LIVE {line:?} pressed");
@@ -407,6 +443,35 @@ mod live {
                 "an unknown button is not pressed as nothing"
             );
             assert_eq!(parse("B:soon"), None);
+            assert_eq!(parse("A:0"), None, "a press held 0 ms could never be seen");
+            assert_eq!(parse("wait:0"), Some((0, ms(0))));
+        }
+
+        #[test]
+        fn polls_far_apart_lose_no_press() {
+            // However long between two polls, each press is seen by one poll at least, in
+            // order: a line's hold starts when the poll after it is due comes.
+            let t = Instant::now();
+            let ms = Duration::from_millis;
+            let mut q = Queue::default();
+            for mask in [A, B, DPAD_DOWN] {
+                q.push(mask, ms(200));
+            }
+            let seen: Vec<u32> = (0..6)
+                .map(|i| q.held(t + ms(10_000 * i)))
+                .filter(|&m| m != 0)
+                .collect();
+            assert_eq!(seen, [A, B, DPAD_DOWN]);
+        }
+
+        #[test]
+        fn lines_are_taken_only_once_complete() {
+            let mut partial = Vec::new();
+            assert!(complete_lines(&mut partial, b"A\nB").len() == 1);
+            assert_eq!(partial, b"B", "the incomplete line waits");
+            assert_eq!(complete_lines(&mut partial, b"+LB:300\r\nwait:5\n"), ["B+LB:300", "wait:5"]);
+            assert!(partial.is_empty());
+            assert!(complete_lines(&mut partial, b"").is_empty());
         }
 
         #[test]
